@@ -1,0 +1,12 @@
+# misc
+runs/
+generated_video/
+
+# weights
+checkpoints/
+*.pth
+
+# dataset
+video_dataset/
+preprocessed_latents/
+*.pt
