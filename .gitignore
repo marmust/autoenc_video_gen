@@ -1,6 +1,7 @@
 # misc
 runs/
 generated_video/
+outputs/
 
 # weights
 checkpoints/
