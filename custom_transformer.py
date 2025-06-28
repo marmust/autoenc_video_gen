@@ -1,0 +1,394 @@
+# %%
+import torch
+import torch.nn as nn
+from torchvision.models import vgg16
+from torchvision import transforms as T
+from torch.utils.data import Dataset, DataLoader
+from decord import VideoReader, cpu
+from torch.optim.lr_scheduler import CosineAnnealingLR
+import torch.nn.functional as F
+from math import floor
+from torch.utils.tensorboard import SummaryWriter
+from peft import get_peft_model, LoraConfig, TaskType
+import os
+from transformers import GPT2LMHeadModel, GPT2Model
+import gc
+
+# %%
+run_device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+BATCH_SIZE = 1
+EPOCHS = 256
+LR = 0.001
+
+RESOLUTION_WIDTH = 128
+RESOLUTION_HEIGHT = 128
+CHANNELS = 3
+CONVERTED_FRAMERATE = 20
+
+WINDOW_SIZE = 28
+INPUT_WINDOW_SIZE = WINDOW_SIZE - 1
+ENCODED_DIM = 1200
+NUM_TRANSFORMER_BLOCKS = 12
+MLP_HIDDEN_DIM = 1800
+NUM_HEADS = 12
+
+DROPOUT = 0.0
+
+TENSORBOARD_LOG_DIR = "runs/custom_transformer/exp2"
+
+# %%
+# --- LOSS ---
+
+# %%
+class PerceptualLoss(nn.Module):
+    def __init__(self, weights=None):
+        super().__init__()
+        vgg = vgg16(pretrained=True).features.eval()
+
+        # Disable inplace ReLUs to avoid autograd bugs
+        for layer in vgg:
+            if isinstance(layer, nn.ReLU):
+                layer.inplace = False
+
+        self.vgg = vgg
+        for param in self.vgg.parameters():
+            param.requires_grad = False
+
+        self.layers = {
+            "0": "relu1_1",
+            "3": "relu1_2",
+            "8": "relu2_2",
+            "15": "relu3_3"
+        }
+
+        self.layer_weights = weights or {
+            "relu1_1": 1.5,
+            "relu1_2": 1.0,
+            "relu2_2": 0.8,
+            "relu3_3": 0.3,
+        }
+
+    def forward(self, x, y):
+        loss = 0.0
+        for i, layer in enumerate(self.vgg):
+            x = layer(x)
+            y = layer(y)
+            name = self.layers.get(str(i))
+            if name:
+                loss += self.layer_weights[name] * F.mse_loss(x, y)
+            if i > max(map(int, self.layers.keys())):
+                break
+        return loss
+
+class CombinedLoss(nn.Module):
+    def __init__(self, perceptual_weight=1.8, mse_weight=0.2):
+        super().__init__()
+        self.perceptual_loss = PerceptualLoss()
+        self.mse_loss = nn.MSELoss()
+        self.perceptual_weight = perceptual_weight
+        self.mse_weight = mse_weight
+
+    def forward(self, reconstructed_images, target_images):
+        return (
+            self.perceptual_weight * self.perceptual_loss(reconstructed_images, target_images)
+            + self.mse_weight * self.mse_loss(reconstructed_images, target_images)
+        )
+
+loss_fn = CombinedLoss()
+loss_fn = loss_fn.to(run_device)
+
+# %%
+# --- TRANSFORMER ---
+
+# %%
+class CausalSelfAttention(nn.Module):
+    def __init__(self, num_heads, dropout=0.1):
+        super().__init__()
+        assert ENCODED_DIM % num_heads == 0
+        self.num_heads = num_heads
+        self.head_dim = ENCODED_DIM // num_heads
+
+        self.qkv_proj = nn.Linear(ENCODED_DIM, 3 * ENCODED_DIM)
+        self.out_proj = nn.Linear(ENCODED_DIM, ENCODED_DIM)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x, attn_mask=None):
+        B, T, C = x.shape
+        qkv = self.qkv_proj(x).reshape(B, T, 3, self.num_heads, self.head_dim)
+        qkv = qkv.permute(2, 0, 3, 1, 4)  # (3, B, num_heads, T, head_dim)
+        q, k, v = qkv[0], qkv[1], qkv[2]
+
+        attn_scores = (q @ k.transpose(-2, -1)) / (self.head_dim ** 0.5)
+        if attn_mask is not None:
+            attn_scores = attn_scores.masked_fill(attn_mask == 0, float('-inf'))
+
+        attn_weights = F.softmax(attn_scores, dim=-1)
+        attn_weights = self.dropout(attn_weights)
+
+        out = attn_weights @ v
+        out = out.transpose(1, 2).reshape(B, T, C)
+        return self.out_proj(out)
+
+# %%
+class TransformerBlock(nn.Module):
+    def __init__(self, num_heads, mlp_hidden_dim, dropout=0.1):
+        super().__init__()
+        self.ln1 = nn.LayerNorm(ENCODED_DIM)
+        self.attn = CausalSelfAttention(num_heads, dropout)
+        self.ln2 = nn.LayerNorm(ENCODED_DIM)
+        self.mlp = nn.Sequential(
+            nn.Linear(ENCODED_DIM, mlp_hidden_dim),
+            nn.GELU(),
+            nn.Linear(mlp_hidden_dim, ENCODED_DIM),
+            nn.Dropout(dropout)
+        )
+
+    def forward(self, x, attn_mask=None):
+        x = x + self.attn(self.ln1(x), attn_mask)
+        x = x + self.mlp(self.ln2(x))
+        return x
+
+# %%
+class Transformer(nn.Module):
+    def __init__(self, seq_len=INPUT_WINDOW_SIZE, num_heads=NUM_HEADS, mlp_hidden_dim=MLP_HIDDEN_DIM, dropout=DROPOUT):
+        super().__init__()
+        self.blocks = nn.ModuleList([
+            TransformerBlock(num_heads, mlp_hidden_dim, dropout)
+            for _ in range(NUM_TRANSFORMER_BLOCKS)
+        ])
+        self.ln_f = nn.LayerNorm(ENCODED_DIM)
+        self.register_buffer("causal_mask", torch.tril(torch.ones(seq_len, seq_len)).unsqueeze(0).unsqueeze(0))
+
+    def forward(self, x):
+        B, T, _ = x.shape
+        attn_mask = self.causal_mask[:, :, :T, :T]
+
+        for block in self.blocks:
+            x = block(x, attn_mask)
+
+        return self.ln_f(x)
+
+# %%
+# --- AUTOENCODER ---
+
+# %%
+class ResidualBlock(nn.Module):
+    def __init__(self, channels):
+        super().__init__()
+        self.block = nn.Sequential(
+            nn.Conv2d(channels, channels, 3, 1, 1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(channels, channels, 3, 1, 1)
+        )
+    def forward(self, x):
+        return x + self.block(x)
+
+# %%
+class Autoencoder(nn.Module):
+    def __init__(self, in_channels=CHANNELS, latent_dim=ENCODED_DIM, input_resolution=(RESOLUTION_WIDTH, RESOLUTION_HEIGHT)):
+        super().__init__()
+        self.latent_dim = latent_dim
+
+        self.encoder = nn.Sequential(
+            nn.Conv2d(in_channels, 32, 4, 2, 1),  # 64x64
+            nn.ReLU(),
+            nn.Conv2d(32, 64, 4, 2, 1),           # 32x32
+            nn.ReLU(),
+            ResidualBlock(64),
+            nn.Conv2d(64, 128, 4, 2, 1),          # 16x16
+            nn.ReLU(),
+            nn.Conv2d(128, 256, 4, 2, 1),         # 8x8
+            nn.ReLU()
+        )
+
+        with torch.no_grad():
+            dummy = torch.zeros(1, in_channels, *input_resolution)
+            enc_out = self.encoder(dummy)
+            self.flattened_size = enc_out.view(1, -1).shape[1]
+
+        self.encoder_fc = nn.Linear(self.flattened_size, latent_dim)
+        self.decoder_fc = nn.Linear(latent_dim, self.flattened_size)
+
+        self.decoder = nn.Sequential(
+            nn.Unflatten(1, enc_out.shape[1:]),
+            nn.ConvTranspose2d(256, 128, 4, 2, 1),  # 16x16
+            nn.ReLU(),
+            nn.ConvTranspose2d(128, 64, 4, 2, 1),   # 32x32
+            nn.ReLU(),
+            ResidualBlock(64),
+            nn.ConvTranspose2d(64, 32, 4, 2, 1),    # 64x64
+            nn.ReLU(),
+            nn.ConvTranspose2d(32, in_channels, 4, 2, 1),  # 128x128
+            nn.Tanh()
+        )
+
+    def encode(self, x):
+        x = self.encoder(x)
+        x = torch.flatten(x, 1)
+        return self.encoder_fc(x)
+
+    def decode(self, z):
+        z = self.decoder_fc(z)
+        return self.decoder(z)
+
+# %%
+# --- MISC ---
+
+# %%
+class PreprocessingFrameDataset(Dataset):
+    def __init__(self, folder_path, window_size=WINDOW_SIZE,
+                 resize=(RESOLUTION_WIDTH, RESOLUTION_HEIGHT),
+                 framerate=CONVERTED_FRAMERATE,
+                 cache_dir='preprocessed_frames'):
+        self.folder_path = folder_path
+        self.window_size = window_size
+        self.resize = resize
+        self.framerate = framerate
+        self.cache_dir = cache_dir
+        os.makedirs(self.cache_dir, exist_ok=True)
+
+        self.resize_transform = T.Compose([
+            T.ToPILImage(),
+            T.Resize(resize),
+            T.ToTensor()
+        ])
+
+        self.frame_files = []
+        self.index = []
+        self._prepare_frames()
+
+    def _prepare_frames(self):
+        video_files = [f for f in os.listdir(self.folder_path) if f.endswith('.mp4')]
+        for i, fname in enumerate(video_files):
+            base = os.path.splitext(fname)[0]
+            cache_path = os.path.join(self.cache_dir, base + '.pt')
+            if not os.path.exists(cache_path):
+                print(f'Preprocessing {fname} -> {cache_path}')
+                vr = VideoReader(os.path.join(self.folder_path, fname), ctx=cpu())
+                original_fps = vr.get_avg_fps()
+                step = max(int(original_fps // self.framerate), 1)
+
+                # sample frames uniformly based on framerate
+                frame_indices = list(range(0, len(vr), step))
+                frames = [self.resize_transform(vr[i].asnumpy()) for i in frame_indices]
+                torch.save(torch.stack(frames), cache_path)
+                del frames, vr
+                gc.collect()
+
+            self.frame_files.append(cache_path)
+            frame_len = torch.load(cache_path, map_location='cpu').shape[0]
+            n_clips = floor(frame_len / self.window_size)
+            for j in range(n_clips):
+                self.index.append((i, j * self.window_size))
+
+    def __len__(self):
+        return len(self.index)
+
+    def __getitem__(self, idx):
+        file_idx, start = self.index[idx]
+        frames = torch.load(self.frame_files[file_idx], mmap=True, map_location='cpu')
+        return frames[start:start + self.window_size]
+
+# %%
+class Trainer:
+    def __init__(self, autoenc, transformer, dataloader, RESOLUTION_HEIGHT=RESOLUTION_HEIGHT, RESOLUTION_WIDTH=RESOLUTION_WIDTH, BOTTLENECK_DIM=ENCODED_DIM, epochs=EPOCHS, lr=LR, device=run_device, loss=loss_fn, writer: SummaryWriter = SummaryWriter(log_dir=TENSORBOARD_LOG_DIR)):
+        self.autoenc = autoenc
+        self.transformer = transformer
+        self.dataloader = dataloader
+        self.epochs = epochs
+        self.device = device
+        self.writer = writer
+        params = list(autoenc.parameters()) + list(transformer.parameters())
+        self.optimizer = torch.optim.Adam(params, lr=lr)
+        self.scheduler = CosineAnnealingLR(self.optimizer, T_max=epochs)
+        self.loss_fn = loss
+        
+        self.RESOLUTION_HEIGHT = RESOLUTION_HEIGHT
+        self.RESOLUTION_WIDTH = RESOLUTION_WIDTH
+        self.BOTTLENECK_DIM = BOTTLENECK_DIM
+
+    def train(self):
+        self.autoenc.train()
+        self.transformer.train()
+        
+        for epoch in range(self.epochs):
+            total_loss = 0.0
+            
+            for batch in self.dataloader:
+                batch = batch.to(self.device)
+                B, T, C, H, W = batch.shape
+                
+                # split the frames into inputs and outputs (shifted by 1 futureward)
+                input_frames = batch[:, :-1, :, :, :].clone()                    # (B, T-1, C, H, W)     [1 TOWARDS THE PAST]
+                output_frames = batch[:, 1:, :, :, :].clone()                    # (B, T-1, C, H, W)     [1 TOWARDS THE FUTURE]
+                
+                # encode the WHOLE sequence even across batches
+                #                  in:   (B, T-1, C, H, W)     ------>     out:   (B, T-1, BOTTLENECK_DIM)
+                input_latents = self.autoenc.encode(input_frames.view(B * (T - 1), C, H, W)).view(B, T - 1, self.BOTTLENECK_DIM)
+                
+                # run the latents thru the transformer
+                #                          [1 TOWARDS THE PAST]                           [1 TOWARDS THE FUTURE]
+                #                  in:   (B, T-1, BOTTLENECK_DIM)     ------>     out:   (B, T-1, BOTTLENECK_DIM)
+                predicted_latents = self.transformer(input_latents)
+                
+                # decode the predicted future back to frames
+                #                  in:   (B, T-1, BOTTLENECK_DIM)     ------>     out:   (B, T-1, C, H, W)
+                predicted_frames = self.autoenc.decode(predicted_latents.reshape(-1, self.BOTTLENECK_DIM)).view(B, T - 1, C, H, W)
+                
+                # calculate the loss between the predicted frames and the target frames
+                self.optimizer.zero_grad()
+                
+                # VGG loss CANNOT handler a time dim, so we combine the sequences with the batches tto trick VGG into thinking that its only batches
+                # NOTE: this doesnt cause cross batch contamination since view works the EXACT same way twice, aligning each target frame with its corresponding prediction
+                predicted_frames = predicted_frames.view(-1, C, H, W)  # (B * (T-1), C, H, W)
+                output_frames = output_frames.view(-1, C, H, W)        # (B * (T-1), C, H, W)
+                
+                loss = self.loss_fn(predicted_frames, output_frames)
+                loss.backward()
+                self.optimizer.step()
+                
+                total_loss += loss.item()
+            
+            # just for the video logging, reshape back to a sequence format (with batches)
+            output_frames_video = output_frames.view(B, T - 1, C, H, W)
+            predicted_frames_video = predicted_frames.view(B, T - 1, C, H, W)
+
+            
+            # logging
+            avg_loss = total_loss / len(self.dataloader)
+            lr = self.optimizer.param_groups[0]['lr']
+            print(f'Epoch {epoch+1}/{self.epochs} - Loss: {avg_loss:.4f} - LR: {lr:.6f}')
+            self.writer.add_scalar("Loss/train", avg_loss, epoch)
+            self.writer.add_scalar("LearningRate", lr, epoch)
+            self.scheduler.step()
+            
+            self.writer.add_video("expected_output", output_frames_video, global_step=epoch, fps=CONVERTED_FRAMERATE)
+            self.writer.add_video("transformer_output", predicted_frames_video, global_step=epoch, fps=CONVERTED_FRAMERATE)
+        
+        self.writer.close()
+
+# %%
+autoencoder = Autoencoder()
+autoencoder = autoencoder.to(run_device)
+
+# %%
+transformer = Transformer()
+transformer = transformer.to(run_device)
+
+# %%
+dataset = PreprocessingFrameDataset(folder_path="video_dataset", window_size=WINDOW_SIZE, resize=(RESOLUTION_WIDTH, RESOLUTION_HEIGHT), framerate=CONVERTED_FRAMERATE)
+dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True, pin_memory=True)
+
+trainer = Trainer(autoencoder, transformer, dataloader)
+
+# %%
+trainer.train()
+
+# %%
+torch.save(autoencoder.state_dict(), "checkpoints/run1/autoencoder.pth")
+torch.save(transformer.state_dict(), "checkpoints/run1/transformer.pth")
+
+# %%
+
+
+
