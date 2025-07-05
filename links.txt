@@ -1,0 +1,73 @@
+# parser will ignore hashtags
+
+# --- surf / bhop videos ---
+
+# these are by "Repsy"
+https://www.youtube.com/watch?v=x9UIsyDjTUE
+https://www.youtube.com/watch?v=acVjd0UBFJw
+https://www.youtube.com/watch?v=3E9TOZrSYIA
+https://www.youtube.com/watch?v=u7edP-8nVQQ
+https://www.youtube.com/watch?v=ZcWVHrtN5Ok
+https://www.youtube.com/watch?v=EEte-0u7S2Q
+https://www.youtube.com/watch?v=jZqHeoDW5LQ
+
+# these are by "warble"
+https://www.youtube.com/watch?v=7Wl6so_xUzY
+https://www.youtube.com/watch?v=_M45mFC1TKE
+https://www.youtube.com/watch?v=ov49DGO-EjQ
+https://www.youtube.com/watch?v=7JDJvoZCe9Y
+
+# these are by "OCCEi"
+https://www.youtube.com/watch?v=G-ptFsWV_KY
+
+# these are by "Clicky Crisp"
+https://www.youtube.com/watch?v=mgnECvX3nnc
+
+# --- FPV videos ---
+
+# these are by "Ellis van Jason"
+https://www.youtube.com/watch?v=NcBjx_eyvxc
+https://www.youtube.com/watch?v=E5jEjJZeCX8
+https://www.youtube.com/watch?v=oetS-gGjaSM
+
+# these are by "Mr Steele" (goat)
+https://www.youtube.com/watch?v=1jjvh3JIkMM
+https://www.youtube.com/watch?v=bBb_kSO3vTo
+https://www.youtube.com/watch?v=wat4SlyJSHs
+
+# --- MTB downhill videos ---
+
+# these are by "Matt Jones"
+https://www.youtube.com/watch?v=n0Anz5tqC-Y
+https://www.youtube.com/watch?v=pLq2xC_wGMg
+
+# these are by "RAAW Mountain Bikes"
+https://www.youtube.com/watch?v=4WrR52FI498
+https://www.youtube.com/watch?v=wxv8HIAHS1Y
+https://www.youtube.com/watch?v=B0tKd4VzWPo
+
+# --- ski / snowboard videos ---
+
+# these are by GoPro (lowk insta360 on top)
+https://www.youtube.com/watch?v=8FQeCnF4sgE
+https://www.youtube.com/watch?v=tImfDQRZc6U
+https://www.youtube.com/watch?v=-Z5a4UQmZLs
+https://www.youtube.com/watch?v=nafcFbSGx0A
+
+# --- various night rides white monster energy vibes ---
+
+# these are by insta360 (???)
+https://www.youtube.com/watch?v=tNXEOfd7pLE
+
+# these are by "Fat and Furious"
+https://www.youtube.com/watch?v=CLREGhw_hiE
+https://www.youtube.com/watch?v=6ZNxLQVHNtQ
+
+# these are by "INTER"
+https://www.youtube.com/watch?v=YrRlwUw0GY4
+https://www.youtube.com/watch?v=T9paTEdgu98
+
+# these are by "squanderLobby"
+https://www.youtube.com/watch?v=1u3QGKioxOM
+https://www.youtube.com/watch?v=AUK2gOT-N1g
+https://www.youtube.com/watch?v=TvUOrnyDPgA
