@@ -11,3 +11,4 @@ checkpoints/
 video_dataset/
 preprocessed_latents/
 *.pt
+data/
