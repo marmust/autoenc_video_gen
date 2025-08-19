@@ -1,11 +1,7 @@
 # misc
-runs/
-sample_videos/
 
 # weights
 
 # dataset
 video_dataset/
 preprocessed_latents/
-*.pt
-data/
