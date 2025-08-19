@@ -1,11 +1,8 @@
 # misc
 runs/
-generated_video/
-outputs/
+sample_videos/
 
 # weights
-checkpoints/
-*.pth
 
 # dataset
 video_dataset/
